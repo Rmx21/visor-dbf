@@ -1,0 +1,12 @@
+# Archivos de datos DBF y auxiliares, que pueden contener información privada.
+*.[dD][bB][fF]
+*.[cC][dD][xX]
+*.[fF][pP][tT]
+*.[dD][bB][tT]
+
+# Archivos locales y del sistema.
+.env
+.env.*
+!.env.example
+Thumbs.db
+.DS_Store

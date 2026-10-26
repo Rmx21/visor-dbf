@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101a1b">
+    <title>Visor DBF</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Visor DBF, inicio">
+        <span>Visor DBF</span>
+      </a>
+      <span class="local-note"><span class="status-dot"></span> Procesamiento local y privado</span>
+    </header>
+
+    <main class="layout">
+      <section class="upload-card" aria-labelledby="upload-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Explora registros, revisa campos y comprueba si hacen falta archivos auxiliares. Todo ocurre en tu navegador.</p>
+            <h2 id="upload-title">Selecciona un archivo DBF</h2>
+          </div>
+          <span class="step-badge">01</span>
+        </div>
+        <label class="dropzone" id="dropzone" for="dbf-input" tabindex="0">
+          <input id="dbf-input" type="file" accept=".dbf,application/octet-stream">
+          <span class="upload-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <span class="drop-title">Arrastra tu archivo aquí</span>
+          <span class="drop-subtitle">o <span class="browse-link">búscalo en tu equipo</span></span>
+          <span class="file-limit">DBF · El archivo no sale de tu dispositivo</span>
+        </label>
+        <div class="companion-row">
+          <div>
+            <span class="companion-title">¿Tienes archivos auxiliares?</span>
+            <span class="companion-copy">Añade CDX, FPT o DBT para comprobarlos y leer los campos memo.</span>
+          </div>
+          <label class="secondary-button" for="companion-input">Añadir archivos</label>
+          <input id="companion-input" type="file" accept=".cdx,.fpt,.dbt" multiple hidden>
+        </div>
+        <div id="selection-summary" class="selection-summary" aria-live="polite">Selecciona un DBF para habilitar el análisis.</div>
+        <button id="analyze-button" class="analyze-button" type="button" disabled>Analizar archivos</button>
+        <div id="error-message" class="error-message" role="alert" hidden></div>
+      </section>
+
+      <section id="results" class="results" hidden aria-live="polite">
+        <div class="results-heading">
+          <div>
+            <p class="eyebrow">ANÁLISIS DEL ARCHIVO</p>
+            <h2 id="file-title">—</h2>
+            <p id="file-subtitle" class="muted"></p>
+            <span class="fpt-legend"><span class="fpt-legend-swatch" aria-hidden="true"></span>Morado: campo memo/gráfico (puede usar FPT)</span>
+          </div>
+          <button id="clear-button" class="text-button" type="button">Cerrar <span aria-hidden="true">×</span></button>
+        </div>
+
+        <div id="summary-cards" class="summary-grid"></div>
+
+        <div class="results-view-tabs" role="group" aria-label="Vista del análisis">
+          <button class="results-view-tab active" type="button" data-view="records" aria-pressed="true">Registros</button>
+          <button class="results-view-tab" type="button" data-view="details" aria-pressed="false">Dependencias y campos</button>
+        </div>
+
+        <div class="results-grid">
+          <aside class="results-sidebar">
+            <section class="panel dependency-panel" aria-labelledby="dependency-title">
+              <div class="panel-heading">
+                <div>
+                  <p class="eyebrow">ARCHIVOS RELACIONADOS</p>
+                  <h3 id="dependency-title">¿Necesita un CDX o FPT?</h3>
+                </div>
+                <span class="step-badge">02</span>
+              </div>
+              <p class="dependency-intro">La recomendación se basa en las marcas y los campos encontrados en el encabezado DBF. Un archivo auxiliar puede ser importante para el programa original, aunque no sea necesario para mostrar los registros.</p>
+              <div id="dependency-list" class="dependency-list"></div>
+              <p class="fine-print">El encabezado permite detectar referencias probables; no confirma que un índice CDX contenga todas las etiquetas esperadas ni que el programa de origen pueda reconstruirlo.</p>
+            </section>
+
+            <section class="panel fields-panel" aria-labelledby="fields-title">
+              <div class="panel-heading compact-heading">
+                <div>
+                  <p class="eyebrow">DISEÑO DE LA TABLA</p>
+                  <h3 id="fields-title">Campos</h3>
+                </div>
+                <button id="download-fields-button" class="icon-button" type="button" aria-label="Descargar campos como CSV" title="Descargar campos como CSV">
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 17v3h14v-3"/></svg>
+                </button>
+              </div>
+              <div class="table-scroll fields-scroll">
+                <table>
+                  <thead><tr><th>Nombre</th><th>Tipo</th><th class="numeric">Longitud</th><th class="numeric">Decimales</th></tr></thead>
+                  <tbody id="fields-body"></tbody>
+                </table>
+              </div>
+            </section>
+          </aside>
+
+          <section class="panel records-panel" aria-labelledby="records-title">
+            <div class="panel-heading records-heading">
+              <div>
+                <p class="eyebrow">VISTA PREVIA</p>
+                <h3 id="records-title">Registros</h3>
+              </div>
+              <div class="record-controls">
+                <label for="encoding-select">Codificación</label>
+                <select id="encoding-select">
+                  <option value="windows-1252">Windows-1252</option>
+                  <option value="utf-8">UTF-8</option>
+                  <option value="ibm866">IBM866</option>
+                </select>
+                <span id="record-count" class="record-count"></span>
+                <button id="download-records-button" class="icon-button" type="button" aria-label="Descargar registros como CSV" title="Descargar registros como CSV">
+                  <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 17v3h14v-3"/></svg>
+                </button>
+                <button id="expand-preview-button" class="expand-button" type="button" aria-expanded="false">Expandir</button>
+              </div>
+            </div>
+            <div class="records-toolbar">
+              <label class="search-box" for="record-search">
+                <span aria-hidden="true">⌕</span>
+                <input id="record-search" type="search" placeholder="Buscar en todos los campos…" autocomplete="off">
+              </label>
+              <div class="search-mode-switch" role="group" aria-label="Modo de búsqueda">
+                <button class="search-mode-button active" type="button" data-mode="and" aria-pressed="true">AND</button>
+                <button class="search-mode-button" type="button" data-mode="or" aria-pressed="false">OR</button>
+              </div>
+              <span id="search-status" class="search-status" aria-live="polite"></span>
+            </div>
+            <div class="table-scroll records-scroll">
+              <div id="search-loading" class="search-loading" role="status" aria-live="polite" hidden>
+                <span class="search-spinner" aria-hidden="true"></span>
+                <span id="search-loading-text">Preparando búsqueda…</span>
+              </div>
+              <table>
+                <thead id="records-head"></thead>
+                <tbody id="records-body"></tbody>
+              </table>
+            </div>
+            <p id="records-note" class="table-note"></p>
+            <div class="pagination" aria-label="Paginación de registros">
+              <button id="previous-page" class="page-button" type="button" aria-label="Página anterior">‹</button>
+              <span id="page-status" class="page-status"></span>
+              <button id="next-page" class="page-button" type="button" aria-label="Página siguiente">›</button>
+            </div>
+          </section>
+        </div>
+      </section>
+      <footer>Los archivos se procesan en este navegador y no se cargan a ningún servidor.</footer>
+    </main>
+  </body>
+</html>
