@@ -8,6 +8,8 @@ const uploadCard = document.querySelector(".upload-card");
 const results = document.getElementById("results");
 const errorMessage = document.getElementById("error-message");
 const encodingSelect = document.getElementById("encoding-select");
+const duplicateFieldSelect = document.getElementById("duplicate-field-select");
+const searchFieldSelect = document.getElementById("search-field-select");
 const companions = new Map();
 const pendingCompanionFiles = new Map();
 let loadedDbf = null;
@@ -19,12 +21,17 @@ let recordPage = 0;
 let recordSearchToken = 0;
 let recordSearchTimer = null;
 let searchMode = "and";
+let searchMatchMode = "exact";
 let appliedSearchTerms = [];
 const recordsPerPage = 250;
 const searchChunkSize = 16384;
 const maxMemoCacheEntries = 1024;
 const maxMemoCacheCharacters = 4 * 1024 * 1024;
 const maxCachedMemoCharacters = 64 * 1024;
+const cdxPageSize = 512;
+const maxCdxDirectoryPages = 10000;
+const maxCdxTags = 5000;
+const maxCdxTagPages = 100000;
 
 const foxProVersions = new Set([0x30, 0x31, 0x32, 0xf5]);
 const memoTypes = new Set(["M", "G", "P", "W"]);
@@ -54,6 +61,12 @@ function decode(bytes, encoding = encodingSelect.value) {
   }
 }
 
+function matchesSearchTerm(value, term) {
+  if (searchMatchMode === "partial") return value.includes(term);
+  const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^\\p{L}\\p{N}_])${escapedTerm}(?=$|[^\\p{L}\\p{N}_])`, "u").test(value);
+}
+
 function readAscii(bytes) {
   return String.fromCharCode(...bytes).replace(/\0.*$/s, "").trim();
 }
@@ -71,10 +84,6 @@ function readMemoPointers(raw, encoding) {
   const text = decode(raw, encoding).replace(/\0+$/g, "").trim();
   if (/^\d+$/.test(text)) pointers.push(Number(text));
   return [...new Set(pointers.filter((pointer) => pointer > 0))];
-}
-
-function readMemoPointer(raw, encoding) {
-  return readMemoPointers(raw, encoding)[0] || 0;
 }
 
 function formatBytes(size) {
@@ -132,6 +141,316 @@ function parseDbf(buffer, name) {
   };
 }
 
+function readFptMemoBlock(pointer, file) {
+  if (!file || !pointer || file.bytes.length < 8) return null;
+  const { bytes, view } = file;
+  const blockSize = view.getUint16(6, false);
+  if (!blockSize) return null;
+  const offset = pointer * blockSize;
+  if (!Number.isSafeInteger(offset) || offset < 8 || offset + 8 > bytes.length) return null;
+  const type = view.getUint32(offset, false);
+  const length = view.getUint32(offset + 4, false);
+  if (length > bytes.length - offset - 8) return null;
+  return { type, length, offset };
+}
+
+function analyzeFptReferences(dbf, file, encoding = encodingSelect.value) {
+  const analysis = {
+    totalReferences: 0,
+    validReferences: 0,
+    invalidReferences: 0,
+    emptyBlocks: 0,
+    textBlocks: 0,
+    binaryBlocks: 0,
+    referencedBytes: 0,
+    typeCounts: new Map(),
+    fieldsWithInvalidReferences: [],
+    headerError: null,
+  };
+  if (file && file.bytes.length < 8) {
+    analysis.headerError = "El encabezado FPT está incompleto.";
+  } else if (file && file.view.getUint16(6, false) === 0) {
+    analysis.headerError = "El encabezado FPT indica un tamaño de bloque no válido.";
+  }
+
+  for (const field of dbf.fields.filter((item) => memoTypes.has(item.type))) {
+    let fieldInvalidReferences = 0;
+    const invalidRecords = [];
+    for (let index = 0; index < dbf.actualRecords; index += 1) {
+      const offset = dbf.headerLength + index * dbf.recordLength;
+      const record = dbf.bytes.subarray(offset, offset + dbf.recordLength);
+      const raw = record.subarray(field.recordOffset, field.recordOffset + field.length);
+      const pointers = readMemoPointers(raw, encoding);
+      if (!pointers.length) continue;
+
+      analysis.totalReferences += 1;
+      let block = null;
+      for (const pointer of pointers) {
+        block = readFptMemoBlock(pointer, file);
+        if (block) break;
+      }
+      if (!block) {
+        if (file) {
+          analysis.invalidReferences += 1;
+          fieldInvalidReferences += 1;
+          if (invalidRecords.length < 5) invalidRecords.push(index + 1);
+        }
+        continue;
+      }
+
+      analysis.validReferences += 1;
+      analysis.referencedBytes += block.length;
+      analysis.typeCounts.set(block.type, (analysis.typeCounts.get(block.type) || 0) + 1);
+      if (block.type === 0) analysis.emptyBlocks += 1;
+      else if (block.type === 1) analysis.textBlocks += 1;
+      else analysis.binaryBlocks += 1;
+    }
+    if (invalidRecords.length) {
+      analysis.fieldsWithInvalidReferences.push({
+        name: field.name,
+        count: fieldInvalidReferences,
+        records: invalidRecords,
+      });
+    }
+  }
+  return analysis;
+}
+
+function parseCdx(bytes, dbf) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes.length < cdxPageSize) throw new Error("El archivo no contiene una página de encabezado CDX completa.");
+
+  const readPage = (offset) => {
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset % cdxPageSize !== 0 || offset + cdxPageSize > bytes.length) {
+      throw new Error("El CDX contiene una referencia a una página fuera del archivo.");
+    }
+    return bytes.subarray(offset, offset + cdxPageSize);
+  };
+  const header = readPage(0);
+  const rootOffset = view.getUint32(0, true);
+  const directoryKeyLength = view.getUint16(12, true);
+  const fileOptions = header[14];
+  if (!(fileOptions & 0x40)) {
+    throw new Error("El encabezado no identifica un CDX compuesto compatible; no se analizaron sus etiquetas.");
+  }
+  if (rootOffset === 0) throw new Error("El CDX no contiene una raíz válida para el directorio de etiquetas.");
+  if (directoryKeyLength !== 10) {
+    throw new Error("La longitud de clave del directorio CDX no es compatible con etiquetas de 10 bytes.");
+  }
+
+  const readNodeHeader = (offset) => {
+    const page = readPage(offset);
+    return {
+      page,
+      isLeaf: Boolean(view.getUint16(offset, true) & 0x02),
+      keyCount: view.getUint16(offset + 2, true),
+      rightSibling: view.getUint32(offset + 8, true),
+    };
+  };
+  const decodeCompactLeaf = (page, keyLength, padByte) => {
+    const pageView = new DataView(page.buffer, page.byteOffset, page.byteLength);
+    const keyCount = pageView.getUint16(2, true);
+    const recnoMask = pageView.getUint32(14, true);
+    const dupMask = page[18];
+    const trailMask = page[19];
+    const recnoBits = page[20];
+    const dupBits = page[21];
+    const trailBits = page[22];
+    const bytesPerEntry = page[23];
+    if (keyCount === 0) return [];
+    if (recnoBits > 32 || dupBits > 8 || trailBits > 8) {
+      throw new Error("El CDX contiene anchos de campo inválidos en una hoja compacta.");
+    }
+    const expectedMask = (bits) => Number((1n << BigInt(bits)) - 1n);
+    if (
+      bytesPerEntry < 1
+      || bytesPerEntry > 8
+      || recnoBits + dupBits + trailBits !== bytesPerEntry * 8
+      || recnoMask !== expectedMask(recnoBits)
+      || dupMask !== expectedMask(dupBits)
+      || trailMask !== expectedMask(trailBits)
+      || keyCount > Math.floor((cdxPageSize - 24) / bytesPerEntry)
+    ) {
+      throw new Error("El CDX contiene una hoja compacta mal formada.");
+    }
+
+    const entries = [];
+    let tail = cdxPageSize;
+    let entryOffset = 24;
+    let previousKey = null;
+    for (let index = 0; index < keyCount; index += 1) {
+      let value = 0n;
+      for (let byte = 0; byte < bytesPerEntry; byte += 1) {
+        value |= BigInt(page[entryOffset + byte]) << BigInt(byte * 8);
+      }
+      entryOffset += bytesPerEntry;
+      const recno = Number(value & BigInt(recnoMask));
+      let duplicateCount = Number((value >> BigInt(recnoBits)) & BigInt(dupMask));
+      const trailingCount = Number((value >> BigInt(recnoBits + dupBits)) & BigInt(trailMask));
+      if (index === 0) duplicateCount = 0;
+      if (duplicateCount > keyLength || trailingCount > keyLength - duplicateCount) {
+        throw new Error("El CDX contiene una clave compacta mal formada.");
+      }
+
+      const freshLength = keyLength - duplicateCount - trailingCount;
+      const freshStart = tail - freshLength;
+      if (freshStart < 24 + keyCount * bytesPerEntry) {
+        throw new Error("Una hoja compacta del CDX está truncada o se solapan sus claves.");
+      }
+      const key = new Uint8Array(keyLength);
+      const unknownPadding = new Uint8Array(keyLength);
+      if (duplicateCount && previousKey) {
+        key.set(previousKey.key.subarray(0, duplicateCount), 0);
+        unknownPadding.set(previousKey.unknownPadding.subarray(0, duplicateCount), 0);
+      }
+      key.set(page.subarray(freshStart, tail), duplicateCount);
+      const paddingStart = duplicateCount + freshLength;
+      if (padByte === null) unknownPadding.fill(1, paddingStart);
+      else key.fill(padByte, paddingStart);
+      tail = freshStart;
+      entries.push({ recordNumber: recno, key, unknownPadding, trailingCount });
+      previousKey = { key, unknownPadding };
+    }
+    return entries;
+  };
+  const decodeDirectoryLeaf = (page) => decodeCompactLeaf(page, directoryKeyLength, 0x20)
+    .map(({ recordNumber, key }) => ({ nameBytes: key, headerOffset: recordNumber }));
+
+  let directoryOffset = rootOffset;
+  const descendedPages = new Set();
+  for (let pageCount = 0; pageCount < maxCdxDirectoryPages; pageCount += 1) {
+    if (descendedPages.has(directoryOffset)) throw new Error("El directorio CDX contiene un ciclo.");
+    descendedPages.add(directoryOffset);
+    const node = readNodeHeader(directoryOffset);
+    if (node.isLeaf) break;
+    if (node.keyCount < 1 || node.keyCount > Math.floor((cdxPageSize - 12) / (directoryKeyLength + 8))) {
+      throw new Error("El directorio CDX no contiene una rama válida.");
+    }
+    const firstChildOffset = directoryOffset + 12 + directoryKeyLength + 4;
+    if (firstChildOffset + 4 > directoryOffset + cdxPageSize) {
+      throw new Error("La rama del directorio CDX está incompleta.");
+    }
+    directoryOffset = view.getUint32(firstChildOffset, false);
+    if (pageCount === maxCdxDirectoryPages - 1) throw new Error("El directorio CDX supera el límite de páginas analizable.");
+  }
+
+  const tagEntries = [];
+  const visitedLeaves = new Set();
+  let leafOffset = directoryOffset;
+  while (true) {
+    if (visitedLeaves.has(leafOffset)) throw new Error("La cadena de hojas del directorio CDX contiene un ciclo.");
+    if (visitedLeaves.size >= maxCdxDirectoryPages) {
+      throw new Error("El directorio CDX supera el límite de páginas analizable.");
+    }
+    visitedLeaves.add(leafOffset);
+    const node = readNodeHeader(leafOffset);
+    if (!node.isLeaf) throw new Error("La cadena del directorio CDX apunta a una página que no es hoja.");
+    tagEntries.push(...decodeDirectoryLeaf(node.page));
+    if (tagEntries.length > maxCdxTags) throw new Error("El CDX supera el límite de etiquetas analizable.");
+    if (node.rightSibling === 0xffffffff) break;
+    leafOffset = node.rightSibling;
+  }
+
+  let totalEntries = 0;
+  let totalOutOfRangeEntries = 0;
+  let totalTagPages = 0;
+  const tags = tagEntries.map(({ nameBytes, headerOffset }) => {
+    const name = decode(nameBytes, encodingSelect.value).replace(/\0.*$/s, "").trim();
+    if (!name) throw new Error("El directorio CDX contiene una etiqueta sin nombre.");
+    if (headerOffset === 0 || headerOffset % cdxPageSize !== 0) {
+      throw new Error(`La etiqueta ${name} apunta a un encabezado CDX inválido.`);
+    }
+    const tagHeader = readPage(headerOffset);
+    const tagView = new DataView(tagHeader.buffer, tagHeader.byteOffset, tagHeader.byteLength);
+    const keyLength = tagView.getUint16(12, true);
+    if (keyLength < 1 || keyLength > cdxPageSize - 20) {
+      throw new Error(`La longitud de clave de la etiqueta ${name} no es válida.`);
+    }
+    const options = tagHeader[14];
+    const rootPageOffset = tagView.getUint32(0, true);
+    if (rootPageOffset === 0) throw new Error(`La etiqueta ${name} no contiene una raíz válida.`);
+    const descending = tagView.getUint16(502, true) !== 0;
+    const forLength = tagView.getUint16(506, true);
+    const keyExpressionLength = tagView.getUint16(510, true);
+    const expressionEnd = headerOffset + cdxPageSize + keyExpressionLength + forLength;
+    if (expressionEnd > bytes.length) throw new Error(`Las expresiones de la etiqueta ${name} están incompletas.`);
+
+    const keyStart = headerOffset + cdxPageSize;
+    const keyExpression = decode(bytes.subarray(keyStart, keyStart + keyExpressionLength), encodingSelect.value).replace(/\0+$/g, "").trim();
+    const forExpression = decode(bytes.subarray(keyStart + keyExpressionLength, expressionEnd), encodingSelect.value).replace(/\0+$/g, "").trim();
+    const collation = String.fromCharCode(...tagHeader.subarray(494, 502)).replace(/\0.*$/s, "").trim();
+    const directField = dbf.fields.find((field) => field.name.toUpperCase() === keyExpression.toUpperCase());
+    const padByte = directField ? (["C", "V"].includes(directField.type) ? 0x20 : 0x00) : null;
+
+    let leafOffset = rootPageOffset;
+    const descendedTagPages = new Set();
+    for (let pageCount = 0; pageCount < maxCdxDirectoryPages; pageCount += 1) {
+      if (descendedTagPages.has(leafOffset)) throw new Error(`El árbol de la etiqueta ${name} contiene un ciclo.`);
+      if (totalTagPages >= maxCdxTagPages) {
+        throw new Error(`El CDX supera el límite de ${maxCdxTagPages.toLocaleString("es-MX")} páginas de etiquetas.`);
+      }
+      descendedTagPages.add(leafOffset);
+      const node = readNodeHeader(leafOffset);
+      if (node.isLeaf) break;
+      totalTagPages += 1;
+      if (node.keyCount < 1 || node.keyCount > Math.floor((cdxPageSize - 12) / (keyLength + 8))) {
+        throw new Error(`La etiqueta ${name} contiene una rama inválida.`);
+      }
+      const firstChildOffset = leafOffset + 12 + keyLength + 4;
+      if (firstChildOffset + 4 > leafOffset + cdxPageSize) {
+        throw new Error(`La rama de la etiqueta ${name} está incompleta.`);
+      }
+      leafOffset = view.getUint32(firstChildOffset, false);
+      if (pageCount === maxCdxDirectoryPages - 1) {
+        throw new Error(`El árbol de la etiqueta ${name} supera el límite de páginas analizable.`);
+      }
+    }
+
+    let entryCount = 0;
+    let outOfRangeEntries = 0;
+    const visitedTagLeaves = new Set();
+    while (true) {
+      if (visitedTagLeaves.has(leafOffset)) throw new Error(`Las hojas de la etiqueta ${name} contienen un ciclo.`);
+      if (visitedTagLeaves.size >= maxCdxDirectoryPages || totalTagPages >= maxCdxTagPages) {
+        throw new Error(`El CDX supera el límite de ${maxCdxTagPages.toLocaleString("es-MX")} páginas de etiquetas.`);
+      }
+      visitedTagLeaves.add(leafOffset);
+      totalTagPages += 1;
+      const node = readNodeHeader(leafOffset);
+      if (!node.isLeaf) throw new Error(`La hoja de la etiqueta ${name} apunta a una página que no es hoja.`);
+      const entries = decodeCompactLeaf(node.page, keyLength, padByte);
+      entryCount += entries.length;
+      outOfRangeEntries += entries.filter(
+        (entry) => entry.recordNumber === 0 || entry.recordNumber > dbf.actualRecords,
+      ).length;
+      if (node.rightSibling === 0xffffffff) break;
+      leafOffset = node.rightSibling;
+    }
+    totalEntries += entryCount;
+    totalOutOfRangeEntries += outOfRangeEntries;
+    return {
+      name,
+      keyExpression,
+      forExpression,
+      keyLength,
+      unique: Boolean(options & 0x01),
+      descending,
+      structural: Boolean(options & 0x80),
+      collation: collation || "No indicada",
+      padByte,
+      entryCount,
+      outOfRangeEntries,
+    };
+  });
+
+  return {
+    structural: Boolean(fileOptions & 0x80),
+    entryCount: totalEntries,
+    outOfRangeEntries: totalOutOfRangeEntries,
+    tags,
+  };
+}
+
 function versionLabel(version) {
   const labels = {
     0x02: "FoxBASE",
@@ -151,15 +470,10 @@ function parseFptMemo(pointer, encoding = encodingSelect.value, file = companion
   if (!file || !pointer) return null;
   const cacheKey = `${encoding}:${pointer}`;
   if (file.memoCache.has(cacheKey)) return file.memoCache.get(cacheKey);
-  const { bytes, view } = file;
-  if (bytes.length < 8) return null;
-  const blockSize = view.getUint16(6, false);
-  if (!blockSize) return null;
-  const offset = pointer * blockSize;
-  if (offset + 8 > bytes.length) return null;
-  const type = view.getUint32(offset, false);
-  const length = view.getUint32(offset + 4, false);
-  if (length > bytes.length - offset - 8) return null;
+  const block = readFptMemoBlock(pointer, file);
+  if (!block) return null;
+  const { bytes } = file;
+  const { type, length, offset } = block;
   const memo = bytes.subarray(offset + 8, offset + 8 + length);
   const value = type === 1
     ? decode(memo, encoding).replace(/\0+$/g, "")
@@ -259,6 +573,48 @@ function exportFieldsCsv() {
   downloadCsv(csvFilename("campos"), rows);
 }
 
+function exportCdxMetadataCsv(button) {
+  const cdx = companions.get("cdx");
+  if (!cdx || cdx.cdxAnalysis.error) return;
+  button.disabled = true;
+  try {
+    const rows = [
+      [
+        "Etiqueta",
+        "Expresión de clave",
+        "Filtro FOR",
+        "Longitud de clave",
+        "Único",
+        "Orden",
+        "Estructural",
+        "Colación",
+        "Entradas",
+        "Referencias DBF fuera de rango",
+        "Tipo de relleno final",
+      ].map((value) => csvCell(value)).join(","),
+      ...cdx.cdxAnalysis.tags.map((tag) => [
+        csvCell(tag.name),
+        csvCell(tag.keyExpression),
+        csvCell(tag.forExpression),
+        csvCell(tag.keyLength, true),
+        csvCell(tag.unique ? "Sí" : "No"),
+        csvCell(tag.descending ? "Descendente" : "Ascendente"),
+        csvCell(tag.structural ? "Sí" : "No"),
+        csvCell(tag.collation),
+        csvCell(tag.entryCount, true),
+        csvCell(tag.outOfRangeEntries, true),
+        csvCell(tag.padByte === null ? "No inferido" : tag.padByte === 0x20 ? "0x20 (espacio)" : "0x00"),
+      ].join(",")),
+    ];
+    const baseName = cdx.name.replace(/\.[^.]+$/, "") || "indice";
+    downloadCsv(`metadatos_cdx_${baseName}.csv`, rows);
+  } catch (error) {
+    showError(`No se pudo exportar el CSV de metadatos CDX: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function exportRecordsCsv(button) {
   const dbf = loadedDbf;
   const matches = recordSearchMatches;
@@ -308,33 +664,45 @@ function companionAssessment() {
   const cdx = companions.get("cdx");
   const fpt = companions.get("fpt");
   const dbt = companions.get("dbt");
-  const memoReferences = memoFields.reduce((total, field) => {
-    const fieldIndex = dbf.fields.indexOf(field);
-    let references = 0;
-    for (let index = 0; index < dbf.actualRecords; index += 1) {
-      const offset = dbf.headerLength + index * dbf.recordLength;
-      const record = dbf.bytes.subarray(offset, offset + dbf.recordLength);
-      if (readMemoPointer(record.subarray(field.recordOffset, field.recordOffset + field.length), encodingSelect.value) > 0) references += 1;
-    }
-    return total + references;
-  }, 0);
+  const fptAnalysis = fpt?.analysis || analyzeFptReferences(dbf, null);
+  const memoReferences = fptAnalysis.totalReferences;
   const result = [];
 
   let cdxDetail;
   let cdxStatus;
   let cdxTone;
   if (hasCdxFlag) {
-    cdxDetail = cdx
-      ? `El encabezado marca un índice estructural y se seleccionó ${cdx.name}. Es un auxiliar del índice, no se usa para decodificar los registros de la tabla.`
-      : "El encabezado marca que hay un índice estructural asociado. Sí se necesita para conservar o utilizar ese índice; no hace falta para leer los registros de la tabla.";
-    cdxStatus = cdx ? "Asociado · cargado" : "Asociado · no cargado";
-    cdxTone = cdx ? "" : "warning";
+    if (cdx?.cdxAnalysis) {
+      if (cdx.cdxAnalysis.error) {
+        cdxDetail = `El encabezado DBF marca un índice estructural, pero no se pudieron leer los metadatos de ${cdx.name}: ${cdx.cdxAnalysis.error}`;
+        cdxStatus = "No se pudo analizar";
+        cdxTone = "warning";
+      } else {
+        cdxDetail = `El encabezado marca un índice estructural y se seleccionó ${cdx.name}. Se leyeron ${cdx.cdxAnalysis.tags.length} etiqueta(s) y ${cdx.cdxAnalysis.entryCount.toLocaleString("es-MX")} entradas${cdx.cdxAnalysis.outOfRangeEntries ? `; ${cdx.cdxAnalysis.outOfRangeEntries.toLocaleString("es-MX")} referencia(s) fuera del rango de registros disponibles` : ""}.`;
+        cdxStatus = `Asociado · ${cdx.cdxAnalysis.tags.length} etiqueta(s)`;
+        cdxTone = cdx.cdxAnalysis.structural ? "" : "warning";
+      }
+    } else {
+      cdxDetail = cdx
+        ? `El encabezado marca un índice estructural y se seleccionó ${cdx.name}. Es un auxiliar del índice, no se usa para decodificar los registros de la tabla.`
+        : "El encabezado marca que hay un índice estructural asociado. Sí se necesita para conservar o utilizar ese índice; no hace falta para leer los registros de la tabla.";
+      cdxStatus = cdx ? "Asociado · cargado" : "Asociado · no cargado";
+      cdxTone = cdx ? "" : "warning";
+    }
   } else {
-    cdxDetail = cdx
-      ? `Se seleccionó ${cdx.name}, pero el DBF no marca un CDX estructural. Puede ser un índice no estructural; este encabezado no permite confirmar si la aplicación lo utiliza.`
-      : "El encabezado no indica un CDX estructural. Ningún índice CDX es necesario para mostrar los campos y registros; la aplicación original podría usar índices no estructurales.";
-    cdxStatus = cdx ? "Opcional · cargado" : "No indicado";
-    cdxTone = "neutral";
+    if (cdx?.cdxAnalysis) {
+      cdxDetail = cdx.cdxAnalysis.error
+        ? `Se seleccionó ${cdx.name}, pero no se pudieron leer sus metadatos: ${cdx.cdxAnalysis.error}`
+        : `Se seleccionó ${cdx.name}; se leyeron ${cdx.cdxAnalysis.tags.length} etiqueta(s) y ${cdx.cdxAnalysis.entryCount.toLocaleString("es-MX")} entradas${cdx.cdxAnalysis.outOfRangeEntries ? `, con ${cdx.cdxAnalysis.outOfRangeEntries.toLocaleString("es-MX")} referencia(s) fuera de rango` : ""}. El DBF no marca un CDX estructural, por lo que podría ser un índice no estructural.`;
+      cdxStatus = cdx.cdxAnalysis.error ? "No se pudo analizar" : `Opcional · ${cdx.cdxAnalysis.tags.length} etiqueta(s)`;
+      cdxTone = cdx.cdxAnalysis.error ? "warning" : "neutral";
+    } else {
+      cdxDetail = cdx
+        ? `Se seleccionó ${cdx.name}, pero el DBF no marca un CDX estructural. Puede ser un índice no estructural; este encabezado no permite confirmar si la aplicación lo utiliza.`
+        : "El encabezado no indica un CDX estructural. Ningún índice CDX es necesario para mostrar los campos y registros; la aplicación original podría usar índices no estructurales.";
+      cdxStatus = cdx ? "Opcional · cargado" : "No indicado";
+      cdxTone = "neutral";
+    }
   }
   result.push({
     extension: "CDX",
@@ -342,22 +710,37 @@ function companionAssessment() {
     detail: cdxDetail,
     status: cdxStatus,
     tone: cdxTone,
-    iconTone: hasCdxFlag && !cdx ? "warning" : "neutral",
+    iconTone: hasCdxFlag && (!cdx || cdx.cdxAnalysis?.error) ? "warning" : "neutral",
   });
 
   if (fptExpected) {
-    const detail = memoReferences === 0
-      ? `${memoFields.length} campo(s) memo/gráfico detectado(s), pero no se encontraron referencias memo en los registros presentes.`
-      : fpt
-        ? `${memoFields.length} campo(s) memo/gráfico y ${memoReferences} referencia(s) detectada(s). ${fpt.name} está cargado; se intentarán leer sus bloques memo.`
+    const invalidFieldSummary = fptAnalysis.fieldsWithInvalidReferences
+      .map((field) => `${field.name}: ${field.count} (registros ${field.records.join(", ")}${field.count > field.records.length ? ", …" : ""})`)
+      .join("; ");
+    const otherTypes = [...fptAnalysis.typeCounts]
+      .filter(([type]) => type !== 0 && type !== 1)
+      .map(([type, count]) => `tipo ${type}: ${count}`)
+      .join(", ");
+    const detail = fpt
+      ? memoReferences === 0
+        ? fptAnalysis.headerError
+          ? `${fpt.name} está cargado, pero ${fptAnalysis.headerError} No se encontraron referencias memo en los registros presentes.`
+          : `${memoFields.length} campo(s) memo/gráfico detectado(s), pero no se encontraron referencias memo en los registros presentes.`
+        : `${fpt.name}: ${fptAnalysis.validReferences}/${memoReferences} referencia(s) legible(s), ${fptAnalysis.invalidReferences} no legible(s). Bloques: ${fptAnalysis.textBlocks} texto, ${fptAnalysis.binaryBlocks} binario(s)${otherTypes ? ` (${otherTypes})` : ""}, ${fptAnalysis.emptyBlocks} vacío(s); ${formatBytes(fptAnalysis.referencedBytes)} sumados por referencia.${fptAnalysis.headerError ? ` ${fptAnalysis.headerError}` : ""}${invalidFieldSummary ? ` Revisar: ${invalidFieldSummary}.` : ""}`
+      : memoReferences === 0
+        ? `${memoFields.length} campo(s) memo/gráfico detectado(s), pero no se encontraron referencias memo en los registros presentes.`
         : `${memoFields.length} campo(s) memo/gráfico (${memoFields.map((field) => field.name).join(", ")}) y ${memoReferences} referencia(s) detectada(s). El formato FoxPro normalmente guarda esos valores en un FPT; sin él, los contenidos no están disponibles.`;
     result.push({
       extension: "FPT",
       answer: memoReferences > 0 ? "sí" : "no",
       detail,
-      status: memoReferences === 0 ? "Sin referencias detectadas" : fpt ? "Necesario para memo · cargado" : "Necesario para memo",
-      tone: memoReferences === 0 || fpt ? "" : "warning",
-      iconTone: memoReferences === 0 || fpt ? "" : "warning",
+      status: memoReferences === 0
+        ? fpt?.analysis.headerError ? "Encabezado inválido" : "Sin referencias detectadas"
+        : fpt
+          ? `${fptAnalysis.validReferences}/${memoReferences} legibles`
+          : "Necesario para memo",
+      tone: fptAnalysis.invalidReferences || fptAnalysis.headerError ? "warning" : memoReferences === 0 || fpt ? "" : "warning",
+      iconTone: fptAnalysis.invalidReferences || fptAnalysis.headerError ? "warning" : memoReferences === 0 || fpt ? "" : "warning",
     });
   } else if (dbtExpected) {
     result.push({
@@ -369,6 +752,15 @@ function companionAssessment() {
       status: memoReferences === 0 ? "Sin referencias detectadas" : "Probablemente usa DBT",
       tone: memoReferences === 0 ? "neutral" : "warning",
       iconTone: memoReferences === 0 ? "neutral" : "warning",
+    });
+  } else if (fpt) {
+    result.push({
+      extension: "FPT",
+      answer: "no",
+      detail: `${fpt.name} está cargado, pero el DBF no contiene campos memo/gráfico que permitan cruzar referencias.`,
+      status: "Sin campos para cruzar",
+      tone: "neutral",
+      iconTone: "neutral",
     });
   } else {
     result.push({
@@ -415,14 +807,33 @@ function renderDependencies() {
     answer.className = `dependency-answer ${item.answer === "sí" ? "yes" : "no"}`;
     answer.textContent = item.answer;
     answer.setAttribute("aria-label", `Necesario: ${item.answer}`);
+    copy.append(name, answer);
+    let cdxDownloadButton = null;
+    if (item.extension === "CDX") {
+      const cdx = companions.get("cdx");
+      if (cdx) {
+        cdxDownloadButton = document.createElement("button");
+        cdxDownloadButton.className = "icon-button cdx-metadata-download";
+        cdxDownloadButton.type = "button";
+        cdxDownloadButton.setAttribute("aria-label", "Descargar metadatos CDX por etiqueta como CSV");
+        cdxDownloadButton.title = cdx.cdxAnalysis.error
+          ? `No se pueden descargar los metadatos: ${cdx.cdxAnalysis.error}`
+          : `Descargar metadatos de ${cdx.cdxAnalysis.tags.length.toLocaleString("es-MX")} etiquetas CDX como CSV`;
+        cdxDownloadButton.disabled = Boolean(cdx.cdxAnalysis.error);
+        cdxDownloadButton.innerHTML = '<svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 17v3h14v-3"/></svg>';
+        cdxDownloadButton.addEventListener("click", () => exportCdxMetadataCsv(cdxDownloadButton));
+      }
+    }
     const detail = document.createElement("div");
     detail.className = "dependency-detail";
     detail.textContent = item.detail;
-    copy.append(name, answer, detail);
+    copy.append(detail);
     const status = document.createElement("span");
     status.className = `dependency-status ${item.tone}`;
     status.textContent = item.status;
-    row.append(icon, copy, status);
+    row.append(icon, copy);
+    if (cdxDownloadButton) row.append(cdxDownloadButton);
+    row.append(status);
     return row;
   }));
 }
@@ -458,8 +869,6 @@ function renderRecords() {
     const th = document.createElement("th");
     if (foxProVersions.has(loadedDbf.version) && memoTypes.has(field.type)) th.className = "fpt-affected";
     if (matchedFieldIndices?.has(fieldIndex) || appliedSearchTerms.some((term) => field.name.toLocaleLowerCase().includes(term))) {
-      const highlighted = document.createElement("mark");
-      highlighted.className = "search-match";
       appendSearchHighlight(th, field.name, appliedSearchTerms);
     } else {
       th.textContent = field.name;
@@ -498,7 +907,7 @@ function renderRecords() {
     const cell = document.createElement("td");
     cell.className = "empty-state";
     cell.colSpan = fields.length;
-    cell.textContent = recordSearchMatches !== null ? "No se encontraron coincidencias." : "El archivo no contiene registros para mostrar.";
+    cell.textContent = recordSearchMatches !== null ? "No hay registros que coincidan con los filtros." : "El archivo no contiene registros para mostrar.";
     row.append(cell);
     rows.push(row);
   }
@@ -507,27 +916,39 @@ function renderRecords() {
   document.getElementById("page-status").textContent = `${recordCount === 0 ? 0 : start + 1}–${end} de ${recordCount.toLocaleString("es-MX")}`;
   document.getElementById("previous-page").disabled = recordPage === 0;
   document.getElementById("next-page").disabled = recordPage >= pageCount - 1;
-  document.getElementById("records-note").textContent = loadedDbf.actualRecords < loadedDbf.recordCount
+  const recordNotes = [loadedDbf.actualRecords < loadedDbf.recordCount
     ? `El encabezado indica ${loadedDbf.recordCount.toLocaleString("es-MX")} registros, pero solo caben ${loadedDbf.actualRecords.toLocaleString("es-MX")} en el archivo. Se muestran hasta ${recordsPerPage} por página.`
-    : `Se muestran hasta ${recordsPerPage} registros por página. Los registros marcados como eliminados siguen visibles.`;
+    : `Se muestran hasta ${recordsPerPage} registros por página. Los registros marcados como eliminados siguen visibles.`];
+  if (duplicateFieldSelect.value !== "") {
+    recordNotes.push(`Repetidos por ${loadedDbf.fields[Number(duplicateFieldSelect.value)].name}: se muestran todas las filas de valores repetidos, incluida la primera, sin distinguir mayúsculas ni espacios externos.`);
+  }
+  document.getElementById("records-note").textContent = recordNotes.join(" ");
 }
 
 async function searchRecords(query) {
   const token = ++recordSearchToken;
   const terms = [...new Set(query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean))];
+  const duplicateFieldIndex = duplicateFieldSelect.value === "" ? -1 : Number(duplicateFieldSelect.value);
+  const searchFieldIndex = searchFieldSelect.value === "" ? -1 : Number(searchFieldSelect.value);
+  const currentSearchMode = searchMode;
   recordPage = 0;
-  document.getElementById("search-status").textContent = terms.length ? "Buscando…" : "";
-  if (!terms.length) {
+  const searching = terms.length > 0;
+  const filteringDuplicates = duplicateFieldIndex >= 0;
+  document.getElementById("search-status").textContent = searching ? "Buscando…" : "";
+  if (!searching && !filteringDuplicates) {
     recordSearchMatches = null;
     appliedSearchTerms = [];
     setSearchLoading(false);
+    document.getElementById("search-status").textContent = "";
     renderRecords();
     return;
   }
-  setSearchLoading(true, "Buscando en los registros…");
+  const initialMessage = searching ? "Buscando en los registros…" : "Filtrando registros repetidos…";
+  setSearchLoading(true, initialMessage);
 
   const matchChunks = [];
   const matchedFieldIndices = new Set();
+  const duplicateGroups = filteringDuplicates ? new Map() : null;
   let matchChunk = new Uint32Array(searchChunkSize);
   let matchChunkLength = 0;
   let matchCount = 0;
@@ -541,19 +962,32 @@ async function searchRecords(query) {
         const record = loadedDbf.bytes.subarray(offset, offset + loadedDbf.recordLength);
         const matchedTerms = new Set();
         const rowFieldIndices = [];
+        let duplicateValue = "";
         for (let fieldIndex = 0; fieldIndex < loadedDbf.fields.length; fieldIndex += 1) {
-          const value = readFieldValue(record, loadedDbf.fields[fieldIndex], encodingSelect.value).toLocaleLowerCase();
-          const fieldMatches = terms.filter((term) => value.includes(term));
+          const shouldSearchField = searching && (searchFieldIndex < 0 || fieldIndex === searchFieldIndex);
+          const shouldReadDuplicate = filteringDuplicates && fieldIndex === duplicateFieldIndex;
+          if (!shouldSearchField && !shouldReadDuplicate) continue;
+          const fieldValue = readFieldValue(record, loadedDbf.fields[fieldIndex], encodingSelect.value);
+          if (shouldReadDuplicate) duplicateValue = fieldValue.trim().toLocaleLowerCase();
+          if (!shouldSearchField) continue;
+          const value = fieldValue.toLocaleLowerCase();
+          const fieldMatches = searching ? terms.filter((term) => matchesSearchTerm(value, term)) : [];
           if (fieldMatches.length) {
             rowFieldIndices.push(fieldIndex);
             fieldMatches.forEach((term) => matchedTerms.add(term));
           }
         }
-        const matchedRow = searchMode === "and"
+        const matchedRow = !searching || (currentSearchMode === "and"
           ? matchedTerms.size === terms.length
-          : matchedTerms.size > 0;
+          : matchedTerms.size > 0);
         if (matchedRow) {
           rowFieldIndices.forEach((fieldIndex) => matchedFieldIndices.add(fieldIndex));
+          if (filteringDuplicates) {
+            const group = duplicateGroups.get(duplicateValue);
+            if (group) group.push(index);
+            else duplicateGroups.set(duplicateValue, [index]);
+            continue;
+          }
           matchChunk[matchChunkLength] = index;
           matchChunkLength += 1;
           matchCount += 1;
@@ -564,16 +998,38 @@ async function searchRecords(query) {
           }
         }
       }
-      const progress = `Buscando… ${batchEnd.toLocaleString("es-MX")} de ${loadedDbf.actualRecords.toLocaleString("es-MX")}`;
+      const progressLabel = searching ? "Buscando…" : "Filtrando…";
+      const progress = `${progressLabel} ${batchEnd.toLocaleString("es-MX")} de ${loadedDbf.actualRecords.toLocaleString("es-MX")}`;
       document.getElementById("search-status").textContent = progress;
       setSearchLoading(true, progress);
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
     if (token !== recordSearchToken) return;
+    if (filteringDuplicates) {
+      const sortedDuplicateGroups = [...duplicateGroups.entries()]
+        .filter(([, indices]) => indices.length > 1)
+        .sort(([left], [right]) => left.localeCompare(right, undefined, { sensitivity: "base", numeric: true }));
+      for (const [, indices] of sortedDuplicateGroups) {
+        for (const index of indices) {
+          matchChunk[matchChunkLength] = index;
+          matchChunkLength += 1;
+          matchCount += 1;
+          if (matchChunkLength === searchChunkSize) {
+            matchChunks.push(matchChunk);
+            matchChunk = new Uint32Array(searchChunkSize);
+            matchChunkLength = 0;
+          }
+        }
+      }
+    }
     if (matchChunkLength) matchChunks.push(matchChunk.subarray(0, matchChunkLength));
     recordSearchMatches = { chunks: matchChunks, count: matchCount, fieldIndices: matchedFieldIndices };
     appliedSearchTerms = terms;
-    document.getElementById("search-status").textContent = `${matchCount.toLocaleString("es-MX")} coincidencias`;
+    document.getElementById("search-status").textContent = searching
+      ? filteringDuplicates
+        ? `${matchCount.toLocaleString("es-MX")} registros repetidos coincidentes`
+        : `${matchCount.toLocaleString("es-MX")} coincidencias`
+      : filteringDuplicates ? `${matchCount.toLocaleString("es-MX")} registros repetidos` : "";
     setSearchLoading(false);
     renderRecords();
   } catch (error) {
@@ -592,6 +1048,15 @@ function render() {
   renderSummary();
   renderDependencies();
   renderFields();
+  duplicateFieldSelect.replaceChildren(new Option("Sin filtro", ""));
+  searchFieldSelect.replaceChildren(new Option("Todos", ""));
+  loadedDbf.fields.forEach((field, index) => {
+    duplicateFieldSelect.add(new Option(field.name, String(index)));
+    searchFieldSelect.add(new Option(field.name, String(index)));
+  });
+  duplicateFieldSelect.value = "";
+  searchFieldSelect.value = "";
+  document.getElementById("record-search").placeholder = "Buscar en todos los campos…";
   recordSearchToken += 1;
   recordSearchMatches = null;
   recordPage = 0;
@@ -667,6 +1132,14 @@ async function analyzeFiles() {
         companion.view = new DataView(buffer);
         companion.memoCache = new Map();
         companion.memoCacheCharacters = 0;
+        companion.analysis = analyzeFptReferences(parsedDbf, companion, encodingSelect.value);
+      } else if (extension === "cdx") {
+        companion.bytes = new Uint8Array(buffer);
+        try {
+          companion.cdxAnalysis = parseCdx(companion.bytes, parsedDbf);
+        } catch (error) {
+          companion.cdxAnalysis = { error: error.message };
+        }
       }
       parsedCompanions.set(extension, companion);
     });
@@ -716,8 +1189,19 @@ companionInput.addEventListener("change", () => {
 });
 encodingSelect.addEventListener("change", () => {
   if (loadedDbf) {
+    const fpt = companions.get("fpt");
+    if (fpt) fpt.analysis = analyzeFptReferences(loadedDbf, fpt, encodingSelect.value);
+    const cdx = companions.get("cdx");
+    if (cdx) {
+      try {
+        cdx.cdxAnalysis = parseCdx(cdx.bytes, loadedDbf);
+      } catch (error) {
+        cdx.cdxAnalysis = { error: error.message };
+      }
+    }
+    renderDependencies();
     const query = document.getElementById("record-search").value;
-    if (query.trim()) searchRecords(query);
+    if (query.trim() || duplicateFieldSelect.value !== "") searchRecords(query);
     else renderRecords();
   }
 });
@@ -725,14 +1209,53 @@ document.getElementById("record-search").addEventListener("input", () => {
   recordSearchToken += 1;
   clearTimeout(recordSearchTimer);
   const query = document.getElementById("record-search").value;
-  if (!query.trim()) {
-    document.getElementById("search-status").textContent = "";
+  const filteringDuplicates = duplicateFieldSelect.value !== "";
+  document.getElementById("search-status").textContent = query.trim() ? "Preparando búsqueda…" : "";
+  if (!query.trim() && !filteringDuplicates) {
     searchRecords("");
     return;
   }
-  document.getElementById("search-status").textContent = "Preparando búsqueda…";
-  setSearchLoading(true, "Preparando búsqueda…");
+  setSearchLoading(true, query.trim() ? "Preparando búsqueda…" : "Preparando filtro…");
   recordSearchTimer = setTimeout(() => searchRecords(query), 250);
+});
+searchFieldSelect.addEventListener("change", () => {
+  const query = document.getElementById("record-search").value;
+  const selectedField = searchFieldSelect.value === "" ? null : loadedDbf.fields[Number(searchFieldSelect.value)];
+  document.getElementById("record-search").placeholder = selectedField
+    ? `Buscar en ${selectedField.name}…`
+    : "Buscar en todos los campos…";
+  recordSearchToken += 1;
+  clearTimeout(recordSearchTimer);
+  document.getElementById("search-status").textContent = query.trim() ? "Preparando búsqueda…" : "";
+  setSearchLoading(true, query.trim() ? "Preparando búsqueda…" : "Preparando filtro…");
+  recordSearchTimer = setTimeout(() => searchRecords(query), 0);
+});
+document.querySelectorAll(".search-match-button").forEach((button) => {
+  button.addEventListener("click", () => {
+    const matchMode = button.dataset.match;
+    if (searchMatchMode === matchMode) return;
+    searchMatchMode = matchMode;
+    document.querySelectorAll(".search-match-button").forEach((item) => {
+      const active = item === button;
+      item.classList.toggle("active", active);
+      item.setAttribute("aria-pressed", String(active));
+    });
+    const query = document.getElementById("record-search").value;
+    recordSearchToken += 1;
+    clearTimeout(recordSearchTimer);
+    if (!query.trim() && duplicateFieldSelect.value === "") return;
+    document.getElementById("search-status").textContent = query.trim() ? "Preparando búsqueda…" : "";
+    setSearchLoading(true, query.trim() ? "Preparando búsqueda…" : "Preparando filtro…");
+    recordSearchTimer = setTimeout(() => searchRecords(query), 0);
+  });
+});
+duplicateFieldSelect.addEventListener("change", () => {
+  const query = document.getElementById("record-search").value;
+  recordSearchToken += 1;
+  clearTimeout(recordSearchTimer);
+  document.getElementById("search-status").textContent = query.trim() ? "Preparando búsqueda…" : "";
+  setSearchLoading(true, query.trim() ? "Preparando búsqueda y filtro…" : "Preparando filtro…");
+  recordSearchTimer = setTimeout(() => searchRecords(query), 0);
 });
 document.querySelectorAll(".search-mode-button").forEach((button) => {
   button.addEventListener("click", () => {
@@ -748,9 +1271,9 @@ document.querySelectorAll(".search-mode-button").forEach((button) => {
     const query = input.value;
     recordSearchToken += 1;
     clearTimeout(recordSearchTimer);
-    if (!query.trim()) return;
-    document.getElementById("search-status").textContent = "Preparando búsqueda…";
-    setSearchLoading(true, "Preparando búsqueda…");
+    if (!query.trim() && duplicateFieldSelect.value === "") return;
+    document.getElementById("search-status").textContent = query.trim() ? "Preparando búsqueda…" : "";
+    setSearchLoading(true, query.trim() ? "Preparando búsqueda…" : "Preparando filtro…");
     recordSearchTimer = setTimeout(() => searchRecords(query), 0);
   });
 });

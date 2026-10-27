@@ -37,7 +37,7 @@
         <div class="companion-row">
           <div>
             <span class="companion-title">¿Tienes archivos auxiliares?</span>
-            <span class="companion-copy">Añade CDX, FPT o DBT para comprobarlos y leer los campos memo.</span>
+            <span class="companion-copy">Añade CDX para leer sus etiquetas; FPT o DBT para los campos memo.</span>
           </div>
           <label class="secondary-button" for="companion-input">Añadir archivos</label>
           <input id="companion-input" type="file" accept=".cdx,.fpt,.dbt" multiple hidden>
@@ -75,9 +75,9 @@
                 </div>
                 <span class="step-badge">02</span>
               </div>
-              <p class="dependency-intro">La recomendación se basa en las marcas y los campos encontrados en el encabezado DBF. Un archivo auxiliar puede ser importante para el programa original, aunque no sea necesario para mostrar los registros.</p>
+              <p class="dependency-intro">La recomendación y el cruce de referencias se basan en las marcas, los campos y registros disponibles del DBF. Un archivo auxiliar puede ser importante para el programa original, aunque no sea necesario para mostrar los registros.</p>
               <div id="dependency-list" class="dependency-list"></div>
-              <p class="fine-print">El encabezado permite detectar referencias probables; no confirma que un índice CDX contenga todas las etiquetas esperadas ni que el programa de origen pueda reconstruirlo.</p>
+              <p class="fine-print">El FPT se valida solo mediante las referencias presentes en los campos memo del DBF; no se buscan bloques sin referencia. El ícono del CDX descarga metadatos generales con una fila por etiqueta y sus referencias a registros DBF fuera de rango. No exporta las entradas individuales ni verifica que las claves coincidan con el DBF o que el índice esté actualizado. El análisis limita el recorrido a 100&nbsp;000 páginas de etiquetas.</p>
             </section>
 
             <section class="panel fields-panel" aria-labelledby="fields-title">
@@ -124,11 +124,25 @@
                 <span aria-hidden="true">⌕</span>
                 <input id="record-search" type="search" placeholder="Buscar en todos los campos…" autocomplete="off">
               </label>
+              <select id="search-field-select" class="search-field-select" aria-label="Columna para buscar">
+                <option value="">Todos</option>
+              </select>
+              <div class="search-match-switch" role="group" aria-label="Tipo de coincidencia">
+                <button class="search-match-button active" type="button" data-match="exact" aria-pressed="true">Exacta</button>
+                <button class="search-match-button" type="button" data-match="partial" aria-pressed="false">Parcial</button>
+              </div>
               <div class="search-mode-switch" role="group" aria-label="Modo de búsqueda">
                 <button class="search-mode-button active" type="button" data-mode="and" aria-pressed="true">AND</button>
                 <button class="search-mode-button" type="button" data-mode="or" aria-pressed="false">OR</button>
               </div>
               <span id="search-status" class="search-status" aria-live="polite"></span>
+            </div>
+            <div class="duplicate-filter-row">
+              <label for="duplicate-field-select">Filtrar repetidos por:</label>
+              <select id="duplicate-field-select">
+                <option value="">Sin filtro</option>
+              </select>
+              <span class="duplicate-filter-hint">Muestra todos los registros de valores repetidos, ordenados por este campo.</span>
             </div>
             <div class="table-scroll records-scroll">
               <div id="search-loading" class="search-loading" role="status" aria-live="polite" hidden>
