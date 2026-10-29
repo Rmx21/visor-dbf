@@ -77,7 +77,7 @@
               </div>
               <p class="dependency-intro">La recomendación y el cruce de referencias se basan en las marcas, los campos y registros disponibles del DBF. Un archivo auxiliar puede ser importante para el programa original, aunque no sea necesario para mostrar los registros.</p>
               <div id="dependency-list" class="dependency-list"></div>
-              <p class="fine-print">El FPT se valida solo mediante las referencias presentes en los campos memo del DBF; no se buscan bloques sin referencia. El ícono del CDX descarga metadatos generales con una fila por etiqueta y sus referencias a registros DBF fuera de rango. No exporta las entradas individuales ni verifica que las claves coincidan con el DBF o que el índice esté actualizado. El análisis limita el recorrido a 100&nbsp;000 páginas de etiquetas.</p>
+              <p class="fine-print">El FPT se valida solo mediante las referencias presentes en los campos memo del DBF; no se buscan bloques sin referencia. El ícono del CDX descarga metadatos generales con una fila por etiqueta. Si el recorrido de entradas supera el límite de 100&nbsp;000 páginas, la descarga sigue disponible; los conteos quedan vacíos y el CSV indica el motivo. No se exportan las entradas individuales ni se verifica que las claves coincidan con el DBF o que el índice esté actualizado.</p>
             </section>
 
             <section class="panel fields-panel" aria-labelledby="fields-title">

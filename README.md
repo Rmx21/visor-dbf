@@ -6,7 +6,7 @@ Visor DBF es una aplicación web estática para inspeccionar archivos `.dbf` en 
 
 1. Abre `index.html` en un navegador moderno, o sirve esta carpeta desde un servidor web estático.
 2. Selecciona un archivo DBF.
-3. Opcionalmente, selecciona el CDX, FPT o DBT correspondiente. Para un CDX compuesto compatible, el ícono dentro de **Archivo .cdx** descarga un CSV compacto de metadatos generales con una fila por etiqueta y sus referencias DBF fuera de rango. El análisis recorre hasta 100 000 páginas de etiquetas.
+3. Opcionalmente, selecciona el CDX, FPT o DBT correspondiente. Para un CDX compuesto compatible, el ícono dentro de **Archivo .cdx** descarga un CSV compacto de metadatos generales con una fila por etiqueta. Si no se completa el recorrido de entradas (limitado a 100 000 páginas), los metadatos siguen disponibles y los conteos de entradas/referencias quedan vacíos, con el motivo indicado en el CSV.
 4. Pulsa **Analizar archivos**.
 5. Recorre los registros por páginas de hasta 250 filas o usa la búsqueda para encontrar texto en todos los campos o en uno seleccionado. **Exacta** (predeterminado) coincide con el término completo; **Parcial** busca fragmentos de texto. Si escribes varias palabras separadas por espacios, **AND** (predeterminado) muestra registros que contienen todas; **OR** muestra los que contienen al menos una.
 6. Opcionalmente, selecciona un campo en **Filtrar repetidos por** para mostrar solo los valores que aparecen más de una vez, con todas sus filas (incluida la primera) y ordenados por ese campo. El criterio se combina con la búsqueda.

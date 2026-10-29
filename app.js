@@ -351,9 +351,6 @@ function parseCdx(bytes, dbf) {
     leafOffset = node.rightSibling;
   }
 
-  let totalEntries = 0;
-  let totalOutOfRangeEntries = 0;
-  let totalTagPages = 0;
   const tags = tagEntries.map(({ nameBytes, headerOffset }) => {
     const name = decode(nameBytes, encodingSelect.value).replace(/\0.*$/s, "").trim();
     if (!name) throw new Error("El directorio CDX contiene una etiqueta sin nombre.");
@@ -382,52 +379,6 @@ function parseCdx(bytes, dbf) {
     const directField = dbf.fields.find((field) => field.name.toUpperCase() === keyExpression.toUpperCase());
     const padByte = directField ? (["C", "V"].includes(directField.type) ? 0x20 : 0x00) : null;
 
-    let leafOffset = rootPageOffset;
-    const descendedTagPages = new Set();
-    for (let pageCount = 0; pageCount < maxCdxDirectoryPages; pageCount += 1) {
-      if (descendedTagPages.has(leafOffset)) throw new Error(`El árbol de la etiqueta ${name} contiene un ciclo.`);
-      if (totalTagPages >= maxCdxTagPages) {
-        throw new Error(`El CDX supera el límite de ${maxCdxTagPages.toLocaleString("es-MX")} páginas de etiquetas.`);
-      }
-      descendedTagPages.add(leafOffset);
-      const node = readNodeHeader(leafOffset);
-      if (node.isLeaf) break;
-      totalTagPages += 1;
-      if (node.keyCount < 1 || node.keyCount > Math.floor((cdxPageSize - 12) / (keyLength + 8))) {
-        throw new Error(`La etiqueta ${name} contiene una rama inválida.`);
-      }
-      const firstChildOffset = leafOffset + 12 + keyLength + 4;
-      if (firstChildOffset + 4 > leafOffset + cdxPageSize) {
-        throw new Error(`La rama de la etiqueta ${name} está incompleta.`);
-      }
-      leafOffset = view.getUint32(firstChildOffset, false);
-      if (pageCount === maxCdxDirectoryPages - 1) {
-        throw new Error(`El árbol de la etiqueta ${name} supera el límite de páginas analizable.`);
-      }
-    }
-
-    let entryCount = 0;
-    let outOfRangeEntries = 0;
-    const visitedTagLeaves = new Set();
-    while (true) {
-      if (visitedTagLeaves.has(leafOffset)) throw new Error(`Las hojas de la etiqueta ${name} contienen un ciclo.`);
-      if (visitedTagLeaves.size >= maxCdxDirectoryPages || totalTagPages >= maxCdxTagPages) {
-        throw new Error(`El CDX supera el límite de ${maxCdxTagPages.toLocaleString("es-MX")} páginas de etiquetas.`);
-      }
-      visitedTagLeaves.add(leafOffset);
-      totalTagPages += 1;
-      const node = readNodeHeader(leafOffset);
-      if (!node.isLeaf) throw new Error(`La hoja de la etiqueta ${name} apunta a una página que no es hoja.`);
-      const entries = decodeCompactLeaf(node.page, keyLength, padByte);
-      entryCount += entries.length;
-      outOfRangeEntries += entries.filter(
-        (entry) => entry.recordNumber === 0 || entry.recordNumber > dbf.actualRecords,
-      ).length;
-      if (node.rightSibling === 0xffffffff) break;
-      leafOffset = node.rightSibling;
-    }
-    totalEntries += entryCount;
-    totalOutOfRangeEntries += outOfRangeEntries;
     return {
       name,
       keyExpression,
@@ -438,15 +389,75 @@ function parseCdx(bytes, dbf) {
       structural: Boolean(options & 0x80),
       collation: collation || "No indicada",
       padByte,
-      entryCount,
-      outOfRangeEntries,
+      rootPageOffset,
     };
   });
+
+  let totalEntries = null;
+  let totalOutOfRangeEntries = null;
+  let analysisError = null;
+  try {
+    let totalTagPages = 0;
+    const tagCounts = [];
+    for (const tag of tags) {
+      let leafOffset = tag.rootPageOffset;
+      const descendedTagPages = new Set();
+      for (let pageCount = 0; pageCount < maxCdxDirectoryPages; pageCount += 1) {
+        if (descendedTagPages.has(leafOffset)) throw new Error(`El árbol de la etiqueta ${tag.name} contiene un ciclo.`);
+        if (totalTagPages >= maxCdxTagPages) {
+          throw new Error(`El CDX supera el límite de ${maxCdxTagPages.toLocaleString("es-MX")} páginas de etiquetas.`);
+        }
+        descendedTagPages.add(leafOffset);
+        const node = readNodeHeader(leafOffset);
+        if (node.isLeaf) break;
+        totalTagPages += 1;
+        if (node.keyCount < 1 || node.keyCount > Math.floor((cdxPageSize - 12) / (tag.keyLength + 8))) {
+          throw new Error(`La etiqueta ${tag.name} contiene una rama inválida.`);
+        }
+        const firstChildOffset = leafOffset + 12 + tag.keyLength + 4;
+        if (firstChildOffset + 4 > leafOffset + cdxPageSize) {
+          throw new Error(`La rama de la etiqueta ${tag.name} está incompleta.`);
+        }
+        leafOffset = view.getUint32(firstChildOffset, false);
+        if (pageCount === maxCdxDirectoryPages - 1) {
+          throw new Error(`El árbol de la etiqueta ${tag.name} supera el límite de páginas analizable.`);
+        }
+      }
+
+      let entryCount = 0;
+      let outOfRangeEntries = 0;
+      const visitedTagLeaves = new Set();
+      while (true) {
+        if (visitedTagLeaves.has(leafOffset)) throw new Error(`Las hojas de la etiqueta ${tag.name} contienen un ciclo.`);
+        if (visitedTagLeaves.size >= maxCdxDirectoryPages || totalTagPages >= maxCdxTagPages) {
+          throw new Error(`El CDX supera el límite de ${maxCdxTagPages.toLocaleString("es-MX")} páginas de etiquetas.`);
+        }
+        visitedTagLeaves.add(leafOffset);
+        totalTagPages += 1;
+        const node = readNodeHeader(leafOffset);
+        if (!node.isLeaf) throw new Error(`La hoja de la etiqueta ${tag.name} apunta a una página que no es hoja.`);
+        const entries = decodeCompactLeaf(node.page, tag.keyLength, tag.padByte);
+        entryCount += entries.length;
+        outOfRangeEntries += entries.filter(
+          (entry) => entry.recordNumber === 0 || entry.recordNumber > dbf.actualRecords,
+        ).length;
+        if (node.rightSibling === 0xffffffff) break;
+        leafOffset = node.rightSibling;
+      }
+      tagCounts.push({ entryCount, outOfRangeEntries });
+    }
+    totalEntries = tagCounts.reduce((total, tag) => total + tag.entryCount, 0);
+    totalOutOfRangeEntries = tagCounts.reduce((total, tag) => total + tag.outOfRangeEntries, 0);
+    tags.forEach((tag, index) => Object.assign(tag, tagCounts[index]));
+  } catch (error) {
+    analysisError = error.message;
+  }
 
   return {
     structural: Boolean(fileOptions & 0x80),
     entryCount: totalEntries,
     outOfRangeEntries: totalOutOfRangeEntries,
+    analysisError,
     tags,
   };
 }
@@ -591,6 +602,7 @@ function exportCdxMetadataCsv(button) {
         "Entradas",
         "Referencias DBF fuera de rango",
         "Tipo de relleno final",
+        "Estado del análisis de entradas",
       ].map((value) => csvCell(value)).join(","),
       ...cdx.cdxAnalysis.tags.map((tag) => [
         csvCell(tag.name),
@@ -604,6 +616,7 @@ function exportCdxMetadataCsv(button) {
         csvCell(tag.entryCount, true),
         csvCell(tag.outOfRangeEntries, true),
         csvCell(tag.padByte === null ? "No inferido" : tag.padByte === 0x20 ? "0x20 (espacio)" : "0x00"),
+        csvCell(cdx.cdxAnalysis.analysisError || "Completo"),
       ].join(",")),
     ];
     const baseName = cdx.name.replace(/\.[^.]+$/, "") || "indice";
@@ -677,6 +690,10 @@ function companionAssessment() {
         cdxDetail = `El encabezado DBF marca un índice estructural, pero no se pudieron leer los metadatos de ${cdx.name}: ${cdx.cdxAnalysis.error}`;
         cdxStatus = "No se pudo analizar";
         cdxTone = "warning";
+      } else if (cdx.cdxAnalysis.analysisError) {
+        cdxDetail = `Se leyeron los metadatos de ${cdx.cdxAnalysis.tags.length} etiqueta(s) de ${cdx.name}, pero no se completó el recorrido de entradas: ${cdx.cdxAnalysis.analysisError}`;
+        cdxStatus = `Metadatos disponibles · ${cdx.cdxAnalysis.tags.length} etiqueta(s)`;
+        cdxTone = "warning";
       } else {
         cdxDetail = `El encabezado marca un índice estructural y se seleccionó ${cdx.name}. Se leyeron ${cdx.cdxAnalysis.tags.length} etiqueta(s) y ${cdx.cdxAnalysis.entryCount.toLocaleString("es-MX")} entradas${cdx.cdxAnalysis.outOfRangeEntries ? `; ${cdx.cdxAnalysis.outOfRangeEntries.toLocaleString("es-MX")} referencia(s) fuera del rango de registros disponibles` : ""}.`;
         cdxStatus = `Asociado · ${cdx.cdxAnalysis.tags.length} etiqueta(s)`;
@@ -693,9 +710,15 @@ function companionAssessment() {
     if (cdx?.cdxAnalysis) {
       cdxDetail = cdx.cdxAnalysis.error
         ? `Se seleccionó ${cdx.name}, pero no se pudieron leer sus metadatos: ${cdx.cdxAnalysis.error}`
-        : `Se seleccionó ${cdx.name}; se leyeron ${cdx.cdxAnalysis.tags.length} etiqueta(s) y ${cdx.cdxAnalysis.entryCount.toLocaleString("es-MX")} entradas${cdx.cdxAnalysis.outOfRangeEntries ? `, con ${cdx.cdxAnalysis.outOfRangeEntries.toLocaleString("es-MX")} referencia(s) fuera de rango` : ""}. El DBF no marca un CDX estructural, por lo que podría ser un índice no estructural.`;
-      cdxStatus = cdx.cdxAnalysis.error ? "No se pudo analizar" : `Opcional · ${cdx.cdxAnalysis.tags.length} etiqueta(s)`;
-      cdxTone = cdx.cdxAnalysis.error ? "warning" : "neutral";
+        : cdx.cdxAnalysis.analysisError
+          ? `Se leyeron los metadatos de ${cdx.cdxAnalysis.tags.length} etiqueta(s) de ${cdx.name}, pero no se completó el recorrido de entradas: ${cdx.cdxAnalysis.analysisError}`
+          : `Se seleccionó ${cdx.name}; se leyeron ${cdx.cdxAnalysis.tags.length} etiqueta(s) y ${cdx.cdxAnalysis.entryCount.toLocaleString("es-MX")} entradas${cdx.cdxAnalysis.outOfRangeEntries ? `, con ${cdx.cdxAnalysis.outOfRangeEntries.toLocaleString("es-MX")} referencia(s) fuera de rango` : ""}. El DBF no marca un CDX estructural, por lo que podría ser un índice no estructural.`;
+      cdxStatus = cdx.cdxAnalysis.error
+        ? "No se pudo analizar"
+        : cdx.cdxAnalysis.analysisError
+          ? `Metadatos disponibles · ${cdx.cdxAnalysis.tags.length} etiqueta(s)`
+          : `Opcional · ${cdx.cdxAnalysis.tags.length} etiqueta(s)`;
+      cdxTone = cdx.cdxAnalysis.error || cdx.cdxAnalysis.analysisError ? "warning" : "neutral";
     } else {
       cdxDetail = cdx
         ? `Se seleccionó ${cdx.name}, pero el DBF no marca un CDX estructural. Puede ser un índice no estructural; este encabezado no permite confirmar si la aplicación lo utiliza.`
@@ -710,7 +733,7 @@ function companionAssessment() {
     detail: cdxDetail,
     status: cdxStatus,
     tone: cdxTone,
-    iconTone: hasCdxFlag && (!cdx || cdx.cdxAnalysis?.error) ? "warning" : "neutral",
+    iconTone: hasCdxFlag && (!cdx || cdx.cdxAnalysis?.error || cdx.cdxAnalysis?.analysisError) ? "warning" : "neutral",
   });
 
   if (fptExpected) {
